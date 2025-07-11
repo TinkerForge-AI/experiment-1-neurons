@@ -1,0 +1,95 @@
+[
+  {
+    "clusters": [
+      {
+        "cluster_label": 0,
+        "positions": [
+          [
+            3
+          ]
+        ],
+        "specialties": [
+          14.189753629676156
+        ],
+        "human_labels": [
+          "Specialty_14.19"
+        ],
+        "active_count": 0,
+        "total_count": 1
+      },
+      {
+        "cluster_label": 1,
+        "positions": [
+          [
+            2
+          ],
+          [
+            8
+          ],
+          [
+            9
+          ]
+        ],
+        "specialties": [
+          9.890368225602915,
+          9.419895510790523,
+          10.157519299429548
+        ],
+        "human_labels": [
+          "Specialty_9.89",
+          "Specialty_9.42",
+          "Specialty_10.16"
+        ],
+        "active_count": 3,
+        "total_count": 3
+      },
+      {
+        "cluster_label": 2,
+        "positions": [
+          [
+            0
+          ],
+          [
+            1
+          ],
+          [
+            4
+          ],
+          [
+            5
+          ],
+          [
+            6
+          ],
+          [
+            7
+          ]
+        ],
+        "specialties": [
+          12.370034669213394,
+          11.698494348045614,
+          11.430444434847571,
+          13.012266532990663,
+          12.995534791772661,
+          12.27597538858687
+        ],
+        "human_labels": [
+          "Specialty_12.37",
+          "Specialty_11.70",
+          "Specialty_11.43",
+          "Specialty_13.01",
+          "Specialty_13.00",
+          "Specialty_12.28"
+        ],
+        "active_count": 3,
+        "total_count": 6
+      }
+    ],
+    "input_signal": 1.0,
+    "goal": "detect_green",
+    "total_neurons": 10,
+    "active_neurons": 6,
+    "iteration": 0,
+    "summary": [
+      {
+        "cluster_label": 

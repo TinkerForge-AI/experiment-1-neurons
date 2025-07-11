@@ -1,0 +1,2 @@
+# This is a binary .npy file, but you can generate it like:
+# np.save('assets/test_pixel_green.npy', np.array([0,255,0]))
