@@ -3,14 +3,14 @@ from sklearn.cluster import KMeans
 
 class NeuronEnsembleMonitor:
     """
-    Monitors and analyzes neural ensemble behavior.
-    
-    Tracks neuron activations, clusters specialties, and maps to human-readable labels.
+    Monitors and analyzes neural ensemble behavior, now with cluster support.
     """
     
-    def __init__(self, neurons, iteration=0):
+    def __init__(self, neurons, clusters=None, controllers=None, iteration=0):
         """Initialize monitor with list of neurons and optional iteration."""
         self.neurons = neurons  # List of Neuron objects
+        self.clusters = clusters if clusters is not None else []
+        self.controllers = controllers if controllers is not None else []
         self.iterative_mapping = {}  # Maps specialty to human label
         self.logs = []
         self.iteration = iteration  # Track experiment iteration
@@ -23,16 +23,23 @@ class NeuronEnsembleMonitor:
         """Get list of currently active neurons."""
         return [neuron for neuron in self.neurons if neuron.active]
 
-    def find_clusters(self, n_clusters=3):
+    def get_active_clusters(self):
+        """Get list of currently active clusters."""
+        return [c for c in self.clusters if any(n.active for n in c.neurons)] if self.clusters else []
+
+    def find_clusters(self, n_clusters=None):
         """
         Cluster neurons by specialty using K-means.
         
         Args:
-            n_clusters: Number of clusters to find
+            n_clusters: Number of clusters to find (default from config)
             
         Returns:
             Dictionary mapping cluster labels to neuron lists
         """
+        from config import NUM_CLUSTERS
+        if n_clusters is None:
+            n_clusters = NUM_CLUSTERS
         if len(self.neurons) < n_clusters:
             n_clusters = len(self.neurons)
             
@@ -76,9 +83,12 @@ class NeuronEnsembleMonitor:
         log_entry = {
             "input_label": input_label,
             "active_neurons": [(n.position, n.specialty) for n in self.get_active_neurons()],
+            "active_clusters": [c.cluster_id for c in self.get_active_clusters()],
             "specialties": self.get_specialties().tolist(),
             "total_active": len(self.get_active_neurons()),
-            "total_neurons": len(self.neurons)
+            "total_neurons": len(self.neurons),
+            "total_clusters": len(self.clusters),
+            "total_active_clusters": len(self.get_active_clusters())
         }
         self.logs.append(log_entry)
 
@@ -94,27 +104,27 @@ class NeuronEnsembleMonitor:
 
     def summarize(self):
         """
-        Generate summary of current ensemble state.
+        Generate summary of current ensemble state using actual Cluster objects.
         
         Returns:
             List of cluster summaries with positions, specialties, and labels
         """
         summary = []
-        clusters = self.find_clusters()
+        clusters = self.clusters if self.clusters else []
         
-        for label, cluster in clusters.items():
-            positions = [n.position for n in cluster]
-            specialties = [n.specialty for n in cluster]
+        for cluster in clusters:
+            positions = [n.position for n in cluster.neurons]
+            specialties = [n.specialty for n in cluster.neurons]
             mapped_labels = [self.iterative_mapping.get(s, f"Specialty_{s:.2f}") for s in specialties]
-            active_count = sum(1 for n in cluster if n.active)
+            active_count = sum(1 for n in cluster.neurons if n.active)
             
             summary.append({
-                "cluster_label": label,
+                "cluster_id": cluster.cluster_id,
                 "positions": positions,
                 "specialties": specialties,
                 "human_labels": mapped_labels,
                 "active_count": active_count,
-                "total_count": len(cluster)
+                "total_count": len(cluster.neurons)
             })
         return summary
 
@@ -125,14 +135,21 @@ class NeuronEnsembleMonitor:
         
         total_active = sum(cluster["active_count"] for cluster in summary)
         total_neurons = sum(cluster["total_count"] for cluster in summary)
-        
-        print(f"Overall Activity: {total_active}/{total_neurons} neurons active ({total_active/total_neurons*100:.1f}%)")
+        if total_neurons == 0:
+            print("No neurons in clusters. Cannot compute activity percentage.")
+            return
+        print(f"Overall Activity: {total_active}/{total_neurons} neurons active ({(total_active/total_neurons*100):.1f}%)")
         print()
         
         for cluster in summary:
-            print(f"Cluster {cluster['cluster_label']}:")
-            print(f"  Active: {cluster['active_count']}/{cluster['total_count']} neurons")
+            print(f"Cluster {cluster['cluster_id']}:")
+            print(f"  Active: {cluster['active_count']}/{cluster['total_count']} neurons ({(cluster['active_count']/cluster['total_count']*100):.1f}%)")
             print(f"  Positions: {cluster['positions']}")
             print(f"  Specialties: {[f'{s:.2f}' for s in cluster['specialties']]}")
             print(f"  Labels: {cluster['human_labels']}")
+            print("  --- Neuron Decisions ---")
+            for neuron in [n for n in self.neurons if n.position in cluster['positions']]:
+                if neuron.decision_log:
+                    last_decision = neuron.decision_log[-1]
+                    print(f"    Neuron {neuron.position}: {last_decision['decision']} | {last_decision['reason']} | Confidence={neuron.confidence:.2f}")
             print()

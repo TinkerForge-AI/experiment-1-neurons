@@ -7,6 +7,40 @@ from state_mgr.neuron_state_manager import save_neuron_state, load_neuron_state
 from state_mgr.monitor_state_manager import save_monitor_state, load_monitor_state
 from mappings.data_loader import load_pixel
 import numpy as np
+import importlib
+
+# Use config.py for first loop, config_training.py for subsequent loops
+def load_config(granular=True, training=False):
+    module_name = 'config_training' if training else 'config'
+    config_module = importlib.import_module(module_name)
+    config_vars = {
+        'NUM_NEURONS': config_module.NUM_NEURONS,
+        'NUM_CLUSTERS': config_module.NUM_CLUSTERS,
+        'COLOR_LABELS': config_module.COLOR_LABELS,
+        'COLOR_RGBS': config_module.COLOR_RGBS,
+        'TRAINING_LOOPS': config_module.TRAINING_LOOPS,
+        'CLUSTER_SPECIALTIES': getattr(config_module, 'CLUSTER_SPECIALTIES', [2, 6, 10]),
+    }
+    if granular:
+        config_vars.update({
+            'ACTIVATION_THRESHOLD': config_module.ACTIVATION_THRESHOLD,
+            'WEIGHT_RANGE': config_module.WEIGHT_RANGE,
+            'CONFIDENCE_INIT': config_module.CONFIDENCE_INIT,
+            'CONFIDENCE_UPDATE_CORRECT': config_module.CONFIDENCE_UPDATE_CORRECT,
+            'CONFIDENCE_UPDATE_INCORRECT': config_module.CONFIDENCE_UPDATE_INCORRECT,
+            'MESSAGE_NOISE_PROB': config_module.MESSAGE_NOISE_PROB,
+            'MESSAGE_FLIP_PROB': config_module.MESSAGE_FLIP_PROB,
+            'MESSAGE_CONFIDENCE_THRESHOLD': config_module.MESSAGE_CONFIDENCE_THRESHOLD,
+            'SPECIALTY_LEARNING_RATE': config_module.SPECIALTY_LEARNING_RATE,
+            'SPECIALTY_REPULSION_STRENGTH': config_module.SPECIALTY_REPULSION_STRENGTH,
+            'SPECIALTY_REPULSION_DISTANCE': config_module.SPECIALTY_REPULSION_DISTANCE,
+            'SPECIALTY_CLAMP_MIN': config_module.SPECIALTY_CLAMP_MIN,
+            'SPECIALTY_CLAMP_MAX': config_module.SPECIALTY_CLAMP_MAX,
+            'WEIGHT_NOISE_RANGE': config_module.WEIGHT_NOISE_RANGE,
+            'LEARNING_NOISE_RANGE': config_module.LEARNING_NOISE_RANGE,
+            'RANDOM_FLIP_PROB': config_module.RANDOM_FLIP_PROB,
+        })
+    globals().update(config_vars)
 
 LOGS_DIR = "logs"
 
@@ -63,14 +97,20 @@ def train_green_detection():
     with open("run_count.txt", "w") as f:
         f.write(str(run_count))
 
-    goal = "detect_green"
-    num_neurons = 10
+    # Use config values for number of neurons
+    num_neurons = globals().get('NUM_NEURONS', 9)
 
     print("[Step 1] Loading or initializing neurons and monitor...")
     neurons = load_neuron_state("network_state.pkl")
     if neurons is None:
         print("  Creating new neural network...")
-        neurons = [Neuron(position=(i,), specialty=np.random.uniform(10, 15)) for i in range(num_neurons)]
+        neurons = []
+        for i in range(num_neurons):
+            cluster_idx = i % globals().get('NUM_CLUSTERS', 3)
+            specialties = globals().get('CLUSTER_SPECIALTIES', [2, 6, 10])
+            specialty = specialties[cluster_idx] + np.random.uniform(-0.5, 0.5)
+            neuron = Neuron(position=(i,), specialty=specialty, cluster=cluster_idx)
+            neurons.append(neuron)
         for i in range(len(neurons)):
             if i > 0:
                 neurons[i].add_neighbor(neurons[i-1])
@@ -93,7 +133,8 @@ def train_green_detection():
     print(f"  Input pixel: {pixel}")
 
     # Randomize goal
-    goal_options = ["detect_red", "detect_green", "detect_blue"]
+    color_labels = globals().get('COLOR_LABELS', ["red", "green", "blue"])
+    goal_options = [f"detect_{label}" for label in color_labels]
     goal = random.choice(goal_options)
     print(f"[Step 2b] Goal for this run: {goal}")
 
@@ -104,18 +145,41 @@ def train_green_detection():
         neuron.receive_goal(goal)
 
     print("[Step 5] Calculating input signal from selected color component...")
-    color_map = {"detect_red": 0, "detect_green": 1, "detect_blue": 2}
-    color_idx = color_map[goal]
+    # Build color_map from config
+    color_map = {f"detect_{label}": idx for idx, label in enumerate(color_labels)}
+    color_idx = color_map.get(goal, 0)
+    # Use selected color channel as signal
     input_signal = pixel[color_idx] / 255.0
     print(f"  Input signal strength: {input_signal}")
 
-    print("[Step 6] Evaluating activation for all neurons (with weight noise)...")
-    for idx, neuron in enumerate(neurons):
-        # Add weight noise
-        noise = random.uniform(-0.05, 0.05)
-        neuron.weight = min(1.0, max(0.0, neuron.weight + noise))
-        neuron.evaluate_activation(input_signal)
-        print(f"    Neuron {idx}: specialty={neuron.specialty:.4f}, weight={neuron.weight:.4f} (noise={noise:+.4f}), active={neuron.active}")
+    print("[Step 6] Evaluating activation for all clusters (with weight noise)...")
+    # Assign neurons to clusters
+    num_clusters = globals().get('NUM_CLUSTERS', 3)
+    cluster_size = max(1, len(neurons) // num_clusters)
+    clusters = []
+    for i in range(num_clusters):
+        cluster_neurons = neurons[i*cluster_size:(i+1)*cluster_size]
+        from cluster import Cluster
+        clusters.append(Cluster(cluster_neurons, cluster_id=f"C{i}"))
+    # Create controller
+    from cluster_controller import ClusterController
+    controller = ClusterController(clusters, controller_id="TrainController")
+    # Add weight noise to each neuron in cluster
+    for cluster in clusters:
+        for neuron in cluster.neurons:
+            noise = random.uniform(-0.05, 0.05)
+            neuron.weight = min(1.0, max(0.0, neuron.weight + noise))
+        cluster.aggregate_signal(input_signal)
+        for idx, neuron in enumerate(cluster.neurons):
+            line = f"    Neuron {neuron.position[0]}: specialty={neuron.specialty:.4f}, weight={neuron.weight:.4f}, active={'True' if neuron.active else 'False'}, confidence={neuron.confidence:.4f}"
+            if hasattr(neuron, 'last_guess') and neuron.active:
+                line += f", guess={getattr(neuron, 'last_guess', None)}, correct?={'yes' if getattr(neuron, 'last_guess', None) == getattr(neuron, 'goal', None) else 'no'}"
+            print(line)
+    # --- Equalize confidence after cluster activation ---
+    controller.equalize_confidence()
+
+    # --- Equalize specialty after cluster activation ---
+    controller.equalize_specialty()
 
     print("[Step 7] Neurons sending messages to neighbors (with message noise)...")
     for idx, neuron in enumerate(neurons):
@@ -158,7 +222,7 @@ def train_green_detection():
 
     # Visualize specialty values over time (save to CSV)
     specialties = [neuron.specialty for neuron in neurons]
-    csv_header = "run,specialty_0,specialty_1,specialty_2,specialty_3,specialty_4,specialty_5,specialty_6,specialty_7,specialty_8,specialty_9\n"
+    csv_header = "run," + ",".join([f"specialty_{i}" for i in range(num_neurons)]) + "\n"
     csv_line = f"{run_count}," + ",".join([f"{s:.4f}" for s in specialties]) + "\n"
     csv_path = "specialties_over_time.csv"
     if not os.path.exists(csv_path):
@@ -229,9 +293,24 @@ def train_green_detection():
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Train bio-inspired neural network.")
-    parser.add_argument('-l', '--loops', type=int, default=1, help='Number of experiment loops to run')
+    parser.add_argument('-l', '--loops', type=int, default=globals().get('TRAINING_LOOPS', 200), help='Number of experiment loops to run')
     args = parser.parse_args()
-
     for i in range(args.loops):
         print(f"\n=== Experiment Loop {i+1}/{args.loops} ===")
-        train_green_detection()
+        if i == 0:
+            load_config(granular=True, training=False)
+            train_green_detection()
+        else:
+            load_config(granular=True, training=True)
+            # Interactive CLI for manual override of training parameters
+            import importlib
+            import config_training
+            print("\n--- Manual Review: Granular Training Parameters ---")
+            for k in dir(config_training):
+                if k.isupper() and not k.startswith('__'):
+                    print(f"{k}: {getattr(config_training, k)}")
+            print("\nYou may now manually edit config_training.py to adjust any parameter.")
+            input("Press Enter when ready to continue with the next training loop...")
+            importlib.reload(config_training)
+            load_config(granular=True, training=True)  # Reload globals with any changes
+            train_green_detection()

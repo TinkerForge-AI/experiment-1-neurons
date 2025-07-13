@@ -53,8 +53,17 @@ def train_green_detection():
     with open("run_count.txt", "w") as f:
         f.write(str(run_count))
 
-    goal = "detect_green"
-    num_neurons = 10
+    # Use NUM_NEURONS from config for network size
+    try:
+        import config_training
+        NUM_NEURONS = getattr(config_training, 'NUM_NEURONS', 9)
+        color_labels = getattr(config_training, 'COLOR_LABELS', ["red", "green", "blue"])
+        color_rgbs = getattr(config_training, 'COLOR_RGBS', [(255,0,0), (0,255,0), (0,0,255)])
+    except Exception:
+        from config import NUM_NEURONS, COLOR_LABELS, COLOR_RGBS
+        color_labels = COLOR_LABELS
+        color_rgbs = COLOR_RGBS
+    num_neurons = NUM_NEURONS
 
     print("[Step 1] Loading or initializing neurons and monitor...")
     neurons = load_neuron_state("network_state.pkl")
@@ -69,7 +78,18 @@ def train_green_detection():
     else:
         print(f"  Loaded {len(neurons)} neurons from state.")
 
-    monitor = load_monitor_state("monitor_state.pkl")
+    # Assign neurons to clusters
+    num_clusters = 3  # Or from config
+    cluster_size = max(1, len(neurons) // num_clusters)
+    clusters = []
+    for i in range(num_clusters):
+        cluster_neurons = neurons[i*cluster_size:(i+1)*cluster_size]
+        from cluster import Cluster
+        clusters.append(Cluster(cluster_neurons, cluster_id=f"C{i}"))
+    from cluster_controller import ClusterController
+    controller = ClusterController(clusters, controller_id="TrainController")
+    monitor = NeuronEnsembleMonitor(neurons, clusters=clusters, controllers=[controller])
+
     print("  Creating new monitor (always references current neurons)...")
     monitor = NeuronEnsembleMonitor(neurons)
 
@@ -81,8 +101,8 @@ def train_green_detection():
     pixel = load_pixel((r, g, b))
     print(f"  Input pixel: {pixel}")
 
-    goal_options = ["detect_red", "detect_green", "detect_blue"]
-    goal = random.choice(goal_options)
+    goal_idx = random.randint(0, len(color_labels) - 1)
+    goal = f"detect_{color_labels[goal_idx]}"
     print(f"[Step 2b] Goal for this run: {goal}")
 
     print("[Step 4] Setting goal for all neurons...")
@@ -90,17 +110,26 @@ def train_green_detection():
         neuron.receive_goal(goal)
 
     print("[Step 5] Calculating input signal from selected color component...")
-    color_map = {"detect_red": 0, "detect_green": 1, "detect_blue": 2}
-    color_idx = color_map[goal]
-    input_signal = pixel[color_idx] / 255.0
+    # For 12 colors, use the max channel as signal, or a custom mapping
+    input_signal = max(pixel) / 255.0
     print(f"  Input signal strength: {input_signal}")
 
-    print("[Step 6] Evaluating activation for all neurons (with weight noise)...")
-    for idx, neuron in enumerate(neurons):
-        noise = random.uniform(-0.05, 0.05)
-        neuron.weight = min(1.0, max(0.0, neuron.weight + noise))
-        neuron.evaluate_activation(input_signal)
-        print(f"    Neuron {idx}: specialty={neuron.specialty:.4f}, weight={neuron.weight:.4f} (noise={noise:+.4f}), active={neuron.active}")
+    print("[Step 6] Evaluating activation for all clusters...")
+    for cluster in clusters:
+        for neuron in cluster.neurons:
+            noise = random.uniform(-0.05, 0.05)
+            neuron.weight = min(1.0, max(0.0, neuron.weight + noise))
+        cluster.aggregate_signal(input_signal)
+        # In activation reporting and learning, randomly select guess from COLOR_LABELS
+        for idx, neuron in enumerate(cluster.neurons):
+            neuron_guess = neuron.get_preferred_color()
+            neuron.last_guess = neuron_guess
+            true_label = goal.replace("detect_", "")
+            correct = (neuron_guess == true_label)
+            if neuron.active:
+                print(f"    Neuron {neuron.position[0]}: specialty={neuron.specialty:.4f}, weight={neuron.weight:.4f}, active=True, guess={neuron_guess}, correct?={'yes' if correct else 'no'}, confidence={neuron.confidence:.4f}")
+            else:
+                print(f"    Neuron {neuron.position[0]}: specialty={neuron.specialty:.4f}, weight={neuron.weight:.4f}, active=False")
 
     print("[Step 7] Neurons sending messages to neighbors (with message noise)...")
     for idx, neuron in enumerate(neurons):
@@ -122,21 +151,76 @@ def train_green_detection():
         print(f"    Neuron {idx}: sent messages, buffer={neuron.message_buffer}")
 
     print("[Step 8] Neuron learning step (with learning noise)...")
+    neuron_changes = []
     for idx, neuron in enumerate(neurons):
         old_specialty = neuron.specialty
+        old_confidence = neuron.confidence
+        old_weight = neuron.weight
+        old_active = neuron.active
         learning_noise = random.uniform(-0.1, 0.1)
+        neuron_guess = getattr(neuron, 'last_guess', None)
+        true_label = goal.replace("detect_", "")
         if neuron.active:
             neuron.learn_specialty(input_signal)
             neuron.specialty += learning_noise
+            # Confidence and color association update now handled in neuron.evaluate_activation
+            neuron.evaluate_activation(input_signal, true_label=true_label, guess_color=neuron_guess)
         else:
             learning_rate = 0.05
             neuron.specialty += learning_rate * (input_signal - neuron.specialty) + learning_noise
-        print(f"    Neuron {idx}: specialty before={old_specialty:.4f}, after={neuron.specialty:.4f}, iteration={neuron.iteration}, learning_noise={learning_noise:+.4f}")
+        new_confidence = neuron.confidence
+        specialty_change = neuron.specialty - old_specialty
+        confidence_change = (new_confidence - old_confidence) if (old_confidence is not None and new_confidence is not None) else None
+        weight_change = neuron.weight - old_weight
+        active_change = int(neuron.active) - int(old_active)
+        neuron_changes.append({
+            'idx': idx,
+            'specialty_before': old_specialty,
+            'specialty_after': neuron.specialty,
+            'specialty_change': specialty_change,
+            'confidence_before': old_confidence,
+            'confidence_after': new_confidence,
+            'confidence_change': confidence_change,
+            'weight_before': old_weight,
+            'weight_after': neuron.weight,
+            'weight_change': weight_change,
+            'active_before': old_active,
+            'active_after': neuron.active,
+            'active_change': active_change,
+            'iteration': neuron.iteration,
+            'learning_noise': learning_noise
+        })
+    # Log color associations for visualization
+    color_assoc_path = "color_associations_over_time.csv"
+    color_header = [f"{color}_n{i}" for i in range(len(neurons)) for color in color_labels]
+    if not os.path.exists(color_assoc_path):
+        with open(color_assoc_path, "w") as f:
+            f.write("run," + ",".join(color_header) + "\n")
+    color_line = [str(run_count)]
+    for color in color_labels:
+        for neuron in neurons:
+            color_line.append(str(neuron.color_success_counts.get(color, 0)))
+    with open(color_assoc_path, "a") as f:
+        f.write(",".join(color_line) + "\n")
+    print(f"[Step 9d] Color associations saved to {color_assoc_path}")
+    # Print summary table
+    print("\nNeuron Change Summary Table:")
+    for change in neuron_changes:
+        conf_delta = f"{change['confidence_change']:+.4f}" if change['confidence_change'] is not None else "  N/A"
+        print(f"Idx: {change['idx']:>3}\n"
+              f"  Specialty (before->after) [Δ]: {change['specialty_before']:.4f}->{change['specialty_after']:.4f} [{change['specialty_change']:+.4f}]\n"
+              f"  Confidence (before->after) [Δ]: {change['confidence_before']:.4f}->{change['confidence_after']:.4f} [{conf_delta}]\n"
+              f"  Weight (before->after) [Δ]: {change['weight_before']:.4f}->{change['weight_after']:.4f} [{change['weight_change']:+.4f}]\n"
+              f"  Active (before->after) [Δ]: {str(change['active_before']):>5}->{str(change['active_after']):>5} [{change['active_change']:+d}]\n"
+              f"  Iteration: {change['iteration']:>3}\n"
+              f"  Learning noise: {change['learning_noise']:+.4f}\n"
+              "----------------------------------------")
 
     print("[Step 9] Logging activity and generating summary...")
     monitor.log_activity(input_label=goal.replace("detect_", ""))
     summary = monitor.summarize()
     monitor.print_human_summary()
+    print("[Step 9c] Controller state:", controller.get_state())
 
     specialties = [neuron.specialty for neuron in neurons]
     csv_header = "run,specialty_0,specialty_1,specialty_2,specialty_3,specialty_4,specialty_5,specialty_6,specialty_7,specialty_8,specialty_9\n"
@@ -207,14 +291,37 @@ def train_green_detection():
 
 if __name__ == "__main__":
     import argparse
+    from config import TRAINING_LOOPS
     parser = argparse.ArgumentParser(description="Train bio-inspired neural network.")
-    parser.add_argument('-l', '--loops', type=int, default=1, help='Number of experiment loops to run')
+    parser.add_argument('-l', '--loops', type=int, default=TRAINING_LOOPS, help='Number of experiment loops to run')
+    parser.add_argument('-rm', '--remove-model', action='store_true', help='Remove model .pkl files and start from scratch')
     args = parser.parse_args()
+
+    if args.remove_model:
+        print("[INFO] Removing model state files: network_state.pkl, monitor_state.pkl")
+        if os.path.exists("network_state.pkl"):
+            os.remove("network_state.pkl")
+            print("  Removed network_state.pkl")
+        if os.path.exists("monitor_state.pkl"):
+            os.remove("monitor_state.pkl")
+            print("  Removed monitor_state.pkl")
+        print("[INFO] Model state reset. Training will start from scratch.")
 
     last_neurons = None
     last_monitor = None
+    import importlib
+    import config_training
     for i in range(args.loops):
         print(f"\n=== Experiment Loop {i+1}/{args.loops} ===")
+        # Interactive CLI for manual override of training parameters
+        if i > 0:
+            print("\n--- Manual Review: Granular Training Parameters ---")
+            for k in dir(config_training):
+                if k.isupper() and not k.startswith('__'):
+                    print(f"{k}: {getattr(config_training, k)}")
+            print("\nYou may now manually edit config_training.py to adjust any parameter.")
+            input("Press Enter when ready to continue with the next training loop...")
+            importlib.reload(config_training)
         train_green_detection()
         # After each loop, reload the latest state
         last_neurons = load_neuron_state("network_state.pkl")
