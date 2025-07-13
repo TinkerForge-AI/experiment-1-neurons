@@ -2,11 +2,11 @@ import numpy as np
 
 class Neuron:
     """
-    Bio-inspired neuron with specialty, activation, and neighbor communication.
+    Bio-inspired neuron with specialty, adaptive weight, activation, and neighbor communication.
     
     Attributes:
         position: Spatial position (tuple)
-        weight: Signal intensity multiplier
+        weight: Signal transformation multiplier (learnable, adapts based on prediction correctness, confidence, and noise)
         active: Current activation state (bool)
         specialty: Emergent specialty value (float)
         neighbors: List of connected neurons
@@ -14,6 +14,9 @@ class Neuron:
         goal: Current goal signal
         goal_alignment: Whether goal aligns with specialty
         has_fired_this_round: Firing state for current round
+        color_success_counts: Tracks correct guesses per color for granular color association
+        consecutive_correct: Number of consecutive correct guesses (for adaptive learning rate)
+        stabilized: True if neuron is using reduced learning rate after stabilization
     """
     
     def __init__(self, position, specialty=None, iteration=0, cluster=None, target_specialty=None):
@@ -37,6 +40,7 @@ class Neuron:
         self.signal_history = []
         self.confidence = 0.5
         self.decision_log = []
+        self.activation_level = 0.0  # For message-based activation adjustments
         # Color association: track correct guesses per color
         try:
             from config import COLOR_LABELS
@@ -44,6 +48,9 @@ class Neuron:
             COLOR_LABELS = ["red", "green", "blue"]
         self.color_success_counts = {color: 0 for color in COLOR_LABELS}
         self.non_activation_count = 0
+        # --- Adaptive learning rate tracking ---
+        self.consecutive_correct = 0  # Track consecutive correct guesses
+        self.stabilized = False  # True if learning rate is reduced
 
     def add_neighbor(self, neighbor):
         """Add a neighboring neuron for communication."""
@@ -76,6 +83,52 @@ class Neuron:
                 self.color_success_counts[sender_preferred_color] += 1
             # Log teach event
             print(f"[Neuron] RECEIVED TEACH: {self.position} <- {message.get('from')}, specialty {old_specialty:.2f}->{self.specialty:.2f}, confidence {old_confidence:.2f}->{self.confidence:.2f}, color {sender_preferred_color}")
+        
+        elif message_type == 'reach' and message.get('help_needed', False):
+            # Help a struggling neighbor by sharing our knowledge
+            if self.confidence > 0.6:  # Only help if we're reasonably confident
+                # Share a bit of our confidence and specialty knowledge
+                old_confidence = self.confidence
+                confidence_share = min(0.1, (self.confidence - 0.5) * 0.2)  # Share excess confidence
+                self.confidence -= confidence_share  # We lose a bit
+                
+                # Send helpful response back
+                help_msg = {
+                    'type': 'help_response',
+                    'confidence_boost': confidence_share,
+                    'suggested_specialty': self.specialty,
+                    'preferred_color': self.get_preferred_color(),
+                    'from': self.position
+                }
+                # Find the sender and send help back
+                for neighbor in self.neighbors:
+                    if neighbor.position == message.get('from'):
+                        neighbor.receive_message(help_msg)
+                        break
+                print(f"[Neuron] {self.position} helped struggling neighbor {message.get('from')} (gave {confidence_share:.2f} confidence)")
+        
+        elif message_type == 'help_response':
+            # Receive help from a neighbor
+            confidence_boost = message.get('confidence_boost', 0)
+            suggested_specialty = message.get('suggested_specialty', self.specialty)
+            old_confidence = self.confidence
+            
+            self.confidence += confidence_boost
+            self.confidence = min(1.0, self.confidence)
+            
+            # Consider the suggested specialty (but don't completely adopt it)
+            if abs(suggested_specialty - self.specialty) < 3.0:
+                self.specialty += 0.1 * (suggested_specialty - self.specialty)
+                self.specialty = min(10.0, max(1.0, self.specialty))
+            
+            print(f"[Neuron] {self.position} received help from {message.get('from')}, confidence {old_confidence:.2f}->{self.confidence:.2f}")
+        
+        elif message_type in ['excite', 'inhibit']:
+            # Simple activation adjustments
+            if message_type == 'excite':
+                self.activation_level += 0.1
+            else:  # inhibit
+                self.activation_level -= 0.1
 
     def receive_goal(self, goal):
         """Set goal and check alignment with specialty."""
@@ -85,6 +138,22 @@ class Neuron:
 
     def evaluate_activation(self, input_signal, true_label=None, guess_color=None):
         self.signal_history.append(input_signal)
+        
+        # Update goal alignment based on current specialty and goal
+        if self.goal:
+            # Enhanced goal alignment calculation
+            goal_color = self.goal.replace("detect_", "") if "detect_" in self.goal else self.goal
+            specialty_range = {
+                "red": (1.5, 3.5),
+                "green": (5.5, 7.5), 
+                "blue": (9.0, 11.0)
+            }
+            if goal_color in specialty_range:
+                min_spec, max_spec = specialty_range[goal_color]
+                self.goal_alignment = min_spec <= self.specialty <= max_spec
+            else:
+                self.goal_alignment = False
+        
         # Consider signal strength, message context, specialty similarity, feedback, noise
         context = {
             'signal_strength': input_signal,
@@ -92,10 +161,19 @@ class Neuron:
             'neighbors': [n.position for n in self.neighbors],
             'specialty_similarity': [abs(self.specialty - n.specialty) for n in self.neighbors],
             'last_sent_message': self.last_sent_message,
-            'confidence': self.confidence
+            'confidence': self.confidence,
+            'goal_alignment': self.goal_alignment,
+            'iteration': self.iteration
         }
-        # Decision logic: stricter threshold, use weight
+        
+        # Enhanced decision logic with goal alignment
         activation_value = input_signal * self.weight
+        if self.goal_alignment:
+            activation_value *= 1.3  # Boost for goal-aligned neurons
+        
+        # Apply message-based activation adjustments
+        activation_value += self.activation_level
+        
         should_fire = activation_value > 0.7
         reason = f"Signal={input_signal:.2f}, Weight={self.weight:.2f}, Activation={activation_value:.2f}, Confidence={self.confidence:.2f}"
         for msg in self.last_received_messages:
@@ -140,31 +218,77 @@ class Neuron:
             self.non_activation_count = 0
         else:
             self.non_activation_count += 1
-        # --- Improved confidence update logic ---
+        # --- Progressive confidence update logic ---
         # Use config_training for granular confidence update rates
         if true_label is not None:
             try:
                 import config_training
                 update_correct = getattr(config_training, 'CONFIDENCE_UPDATE_CORRECT', 0.2)
                 update_incorrect = getattr(config_training, 'CONFIDENCE_UPDATE_INCORRECT', 0.2)
+                early_rounds = getattr(config_training, 'EARLY_TRAINING_ROUNDS', 50)
+                
+                # Get current training round from context or cluster
+                training_round = 0
+                if hasattr(self, 'training_round'):
+                    training_round = self.training_round
+                elif self.cluster and hasattr(self.cluster, 'training_round'):
+                    training_round = self.cluster.training_round
+                
+                # Progressive scaling: be gentler in early rounds
+                if training_round < early_rounds:
+                    # In early rounds, reduce penalties significantly
+                    progress = training_round / early_rounds
+                    penalty_scale = 0.1 + 0.9 * progress  # Start at 10% penalty, scale up
+                    reward_scale = 1.0  # Keep full rewards
+                else:
+                    penalty_scale = 1.0
+                    reward_scale = 1.0
+                    
             except Exception:
                 update_correct = 0.2
                 update_incorrect = 0.2
+                penalty_scale = 1.0
+                reward_scale = 1.0
+            
             # Use guess_color if provided, else fallback to self.goal
             guess_color = getattr(self, 'last_guess', None)
             predicted = guess_color if guess_color is not None else (self.goal if should_fire else 'none')
+            
+            old_confidence = self.confidence
+            # --- Adaptive learning rate logic ---
+            try:
+                answer_threshold = getattr(config_training, 'CONCURRENT_ANSWER_THRESHOLD', 5)
+                update_correct_min = getattr(config_training, 'CONFIDENCE_UPDATE_CORRECT_MIN', 0.05)
+            except Exception:
+                answer_threshold = 5
+                update_correct_min = 0.05
             if predicted == true_label:
-                self.confidence += update_correct * activation_value
+                self.consecutive_correct += 1
+                if self.consecutive_correct >= answer_threshold:
+                    if not self.stabilized:
+                        print(f"[Neuron] {self.position} stabilized: {self.consecutive_correct} correct in a row. Using reduced learning rate.")
+                    self.stabilized = True
+                    update_correct = update_correct_min
+                self.confidence += update_correct * activation_value * reward_scale
                 # Hebbian-like: strengthen color association
                 if guess_color is not None:
                     self.color_success_counts[guess_color] += 1
             else:
-                self.confidence -= update_incorrect * activation_value
+                self.consecutive_correct = 0
+                self.stabilized = False
+                # Apply scaled penalty (much gentler in early rounds)
+                penalty = update_incorrect * activation_value * penalty_scale
+                self.confidence -= penalty
                 # Weaken color association
                 if guess_color is not None and self.color_success_counts[guess_color] > 0:
                     self.color_success_counts[guess_color] -= 1
+                    
             # Clamp confidence
             self.confidence = min(1.0, max(0.0, self.confidence))
+            
+            # Log significant confidence changes
+            if abs(self.confidence - old_confidence) > 0.1:
+                print(f"[Neuron] {self.position} confidence: {old_confidence:.2f}->{self.confidence:.2f} (correct={predicted==true_label}, penalty_scale={penalty_scale:.2f})")
         # Participation health: penalize if non-activation count exceeds threshold
         if self.non_activation_count > 5:
             self.confidence = max(0.0, self.confidence - 0.05)
@@ -183,28 +307,75 @@ class Neuron:
         best_colors = [c for c, v in self.color_success_counts.items() if v == max_count]
         return random.choice(best_colors)
 
-    def send_message(self):
+    def send_message(self, training_round=0):
+        """Send messages to neighbors based on confidence and specialty.
+        
+        Args:
+            training_round: Current training round for adaptive thresholds
+        """
         import config_training
-        teach_threshold = getattr(config_training, 'CONFIDENCE_SPECIALIZATION_THRESHOLD', 0.85)
+        
+        # Progressive teach threshold: start low, increase over time
+        base_threshold = getattr(config_training, 'CONFIDENCE_SPECIALIZATION_THRESHOLD', 0.85)
+        early_rounds = getattr(config_training, 'EARLY_TRAINING_ROUNDS', 50)
+        
+        if training_round < early_rounds:
+            # Start with much lower threshold, gradually increase
+            progress = training_round / early_rounds
+            teach_threshold = 0.3 + (base_threshold - 0.3) * progress
+        else:
+            teach_threshold = base_threshold
+            
+        messages_sent = 0
+        
         for neighbor in self.neighbors:
             specialty_diff = abs(self.specialty - neighbor.specialty)
-            # Send teach message if confident and specialties are close
-            if self.confidence > teach_threshold and specialty_diff <= 2.0:
+            
+            # Send teach message if confident enough and specialties are compatible
+            if self.confidence > teach_threshold and specialty_diff <= 3.0:
                 msg = {
                     'type': 'teach',
                     'specialty': self.specialty,
                     'confidence': self.confidence,
                     'preferred_color': self.get_preferred_color(),
-                    'from': self.position
+                    'from': self.position,
+                    'training_round': training_round
                 }
                 neighbor.receive_message(msg)
                 self.last_sent_message = msg
-            # ...existing excite/inhibit logic...
-            elif self.confidence < 0.7 or specialty_diff < 2.5:
-                msg_type = 'excite' if self.active else 'inhibit'
-                msg = {'type': msg_type, 'specialty': self.specialty, 'from': self.position}
+                messages_sent += 1
+                
+            # Send reach message if we need help (low confidence)
+            elif self.confidence < 0.4 and specialty_diff > 1.0:
+                msg = {
+                    'type': 'reach',
+                    'specialty': self.specialty,
+                    'confidence': self.confidence,
+                    'help_needed': True,
+                    'from': self.position,
+                    'training_round': training_round
+                }
                 neighbor.receive_message(msg)
                 self.last_sent_message = msg
+                messages_sent += 1
+                
+            # Basic excite/inhibit logic
+            elif specialty_diff < 2.5:
+                msg_type = 'excite' if self.active else 'inhibit'
+                msg = {
+                    'type': msg_type, 
+                    'specialty': self.specialty, 
+                    'from': self.position,
+                    'training_round': training_round
+                }
+                neighbor.receive_message(msg)
+                self.last_sent_message = msg
+                messages_sent += 1
+                
+        if messages_sent > 0:
+            print(f"[Neuron] {self.position} sent {messages_sent} messages (conf={self.confidence:.2f}, thresh={teach_threshold:.2f})")
+        
+        return messages_sent
 
     def propagate_goal(self):
         """Propagate goal to neighboring neurons."""
@@ -214,7 +385,7 @@ class Neuron:
 
     def learn_specialty(self, input_data, all_neurons=None):
         """
-        Adjust specialty based on successful activations, with clamping and repulsion.
+        Adjust specialty and weight based on successful activations, prediction correctness, confidence, and repulsion.
         Args:
             input_data: The input that caused activation
             all_neurons: List of all neurons for repulsion
@@ -235,18 +406,55 @@ class Neuron:
                         diff = self.specialty - other.specialty
                         if abs(diff) < 2.0:
                             self.specialty += repulsion_strength * diff
-            # Clamp specialty between 1 and 10
-            self.specialty = max(1, min(self.specialty, 10))
-        # Notify cluster of specialty change
+            # --- Adaptive weight learning ---
+            try:
+                import config_training
+                weight_lr = getattr(config_training, 'WEIGHT_LEARNING_RATE', 0.2)
+                weight_noise_range = getattr(config_training, 'WEIGHT_NOISE_RANGE', (-0.05, 0.05))
+                weight_clamp_min, weight_clamp_max = getattr(config_training, 'WEIGHT_RANGE', (0.3, 1.0))
+            except Exception:
+                weight_lr = 0.2
+                weight_noise_range = (-0.05, 0.05)
+                weight_clamp_min, weight_clamp_max = 0.3, 1.0
+            import random
+            # Use last decision for correctness and confidence
+            last_decision = self.decision_log[-1] if self.decision_log else None
+            correct = False
+            confidence = self.confidence
+            if last_decision and 'context' in last_decision:
+                context = last_decision['context']
+                true_label = context.get('true_label', None)
+                guess_color = getattr(self, 'last_guess', None)
+                predicted = guess_color if guess_color is not None else (self.goal if self.active else 'none')
+                correct = (predicted == true_label)
+            # Weight update: proportional to confidence and correctness
+            noise = random.uniform(*weight_noise_range)
+            old_weight = self.weight
+            if correct:
+                self.weight += weight_lr * confidence * (1.0 - self.weight) + noise
+            else:
+                self.weight -= weight_lr * (1.0 - confidence) * (self.weight - weight_clamp_min) + noise
+            # Clamp weight
+            self.weight = max(weight_clamp_min, min(self.weight, weight_clamp_max))
+            if abs(self.weight - old_weight) > 0.01:
+                print(f"[Neuron] {self.position} weight: {old_weight:.4f}->{self.weight:.4f} (correct={correct}, conf={confidence:.2f})")
+        # Clamp specialty between 1 and 10
+        self.specialty = max(1, min(self.specialty, 10))
+        # Notify cluster of specialty change and trigger controller updates
         if self.cluster is not None:
-            self.cluster.adapt_specialty()
+            if hasattr(self.cluster, 'adapt_specialty'):
+                self.cluster.adapt_specialty()
+            # Notify controller through cluster
+            if hasattr(self.cluster, 'controller') and self.cluster.controller:
+                self.cluster.controller.on_neuron_specialty_change(self, self.cluster)
 
     def clear_round(self):
         """Clear round-specific state for next processing cycle."""
         self.has_fired_this_round = False
         self.active = False
         self.message_buffer = []
-        pass
+        self.last_received_messages = []
+        self.activation_level = 0.0  # Reset message-based activation adjustments
 
     def clear_messages(self):
         self.message_buffer = []

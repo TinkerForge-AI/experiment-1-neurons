@@ -1,6 +1,6 @@
 # Experiment configuration for neural network
 
-NUM_NEURONS = 9
+NUM_NEURONS = 55
 NUM_CLUSTERS = 3
 TRAINING_LOOPS = 200
 TEST_SAMPLES = 10

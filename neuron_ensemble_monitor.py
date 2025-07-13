@@ -129,7 +129,7 @@ class NeuronEnsembleMonitor:
         return summary
 
     def print_human_summary(self):
-        """Print human-readable summary of ensemble activity."""
+        """Print human-readable summary of ensemble activity with controller insights."""
         print("\n=== Ensemble Activity Summary ===")
         summary = self.summarize()
         
@@ -139,17 +139,38 @@ class NeuronEnsembleMonitor:
             print("No neurons in clusters. Cannot compute activity percentage.")
             return
         print(f"Overall Activity: {total_active}/{total_neurons} neurons active ({(total_active/total_neurons*100):.1f}%)")
+        
+        # Show controller specialization assignments if available
+        if self.controllers and len(self.controllers) > 0:
+            controller = self.controllers[0]
+            if hasattr(controller, 'cluster_assignments') and hasattr(controller, 'target_specialties'):
+                print(f"Controller Assignments: {controller.cluster_assignments}")
+                print(f"Target Specialties: {controller.target_specialties}")
         print()
         
         for cluster in summary:
-            print(f"Cluster {cluster['cluster_id']}:")
+            cluster_id = cluster['cluster_id']
+            print(f"Cluster {cluster_id}:")
             print(f"  Active: {cluster['active_count']}/{cluster['total_count']} neurons ({(cluster['active_count']/cluster['total_count']*100):.1f}%)")
             print(f"  Positions: {cluster['positions']}")
             print(f"  Specialties: {[f'{s:.2f}' for s in cluster['specialties']]}")
+            
+            # Show target assignment if available
+            if self.controllers and len(self.controllers) > 0:
+                controller = self.controllers[0]
+                if hasattr(controller, 'cluster_assignments'):
+                    target_color = controller.cluster_assignments.get(cluster_id, "unassigned")
+                    target_spec = controller.target_specialties.get(target_color, "N/A") if target_color != "unassigned" else "N/A"
+                    cluster_mean = sum(cluster['specialties']) / len(cluster['specialties']) if cluster['specialties'] else 0
+                    print(f"  Target: {target_color} (specialty {target_spec}) | Current Mean: {cluster_mean:.2f}")
+            
             print(f"  Labels: {cluster['human_labels']}")
             print("  --- Neuron Decisions ---")
             for neuron in [n for n in self.neurons if n.position in cluster['positions']]:
                 if neuron.decision_log:
                     last_decision = neuron.decision_log[-1]
-                    print(f"    Neuron {neuron.position}: {last_decision['decision']} | {last_decision['reason']} | Confidence={neuron.confidence:.2f}")
+                    goal_align = "✓" if getattr(neuron, 'goal_alignment', False) else "✗"
+                    target_spec = getattr(neuron, 'target_specialty', 'N/A')
+                    print(f"    Neuron {neuron.position}: {last_decision['decision']} | Goal:{goal_align} | Target:{target_spec} | Confidence={neuron.confidence:.2f}")
+                    print(f"      Reason: {last_decision['reason']}")
             print()

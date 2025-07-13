@@ -69,12 +69,30 @@ def train_green_detection():
     neurons = load_neuron_state("network_state.pkl")
     if neurons is None:
         print("  Creating new neural network...")
-        neurons = [Neuron(position=(i,), specialty=np.random.uniform(10, 15)) for i in range(num_neurons)]
+        # Give neurons initial specialties based on position for better convergence
+        neurons = []
+        for i in range(num_neurons):
+            # Distribute specialties across the color space more evenly
+            initial_specialty = 1.0 + (i / num_neurons) * 9.0  # Spread from 1.0 to 10.0
+            neurons.append(Neuron(position=(i,), specialty=initial_specialty))
+        
+        # Create robust neighbor connections - each neuron has 2-4 neighbors
         for i in range(len(neurons)):
+            # Linear neighbors
             if i > 0:
                 neurons[i].add_neighbor(neurons[i-1])
             if i < len(neurons) - 1:
                 neurons[i].add_neighbor(neurons[i+1])
+            
+            # Add some skip connections for better communication
+            if i >= 2:
+                neurons[i].add_neighbor(neurons[i-2])
+            if i < len(neurons) - 2:
+                neurons[i].add_neighbor(neurons[i+2])
+        
+        print(f"  Created {len(neurons)} neurons with distributed specialties")
+        for i, n in enumerate(neurons):
+            print(f"    Neuron {i}: specialty={n.specialty:.2f}, neighbors={len(n.neighbors)}")
     else:
         print(f"  Loaded {len(neurons)} neurons from state.")
 
@@ -86,12 +104,14 @@ def train_green_detection():
         cluster_neurons = neurons[i*cluster_size:(i+1)*cluster_size]
         from cluster import Cluster
         clusters.append(Cluster(cluster_neurons, cluster_id=f"C{i}"))
+    
+    # Create controller and monitor with proper integration
     from cluster_controller import ClusterController
     controller = ClusterController(clusters, controller_id="TrainController")
     monitor = NeuronEnsembleMonitor(neurons, clusters=clusters, controllers=[controller])
-
-    print("  Creating new monitor (always references current neurons)...")
-    monitor = NeuronEnsembleMonitor(neurons)
+    
+    print(f"[Step 1b] Created controller with cluster assignments: {controller.cluster_assignments}")
+    print(f"[Step 1c] Monitor tracking {len(monitor.neurons)} neurons, {len(monitor.clusters)} clusters, {len(monitor.controllers)} controllers")
 
     print("[Step 2] Loading and processing input pixel...")
     import random
@@ -115,40 +135,54 @@ def train_green_detection():
     print(f"  Input signal strength: {input_signal}")
 
     print("[Step 6] Evaluating activation for all clusters...")
+    # Determine if this is the first few rounds for initial learning
+    is_initial_round = run_count <= 3  # First 3 rounds activate all neurons
+    print(f"  Run count: {run_count}, Initial round: {is_initial_round}")
+    
+    # Set training round on clusters and neurons for progressive learning
     for cluster in clusters:
+        cluster.training_round = run_count
         for neuron in cluster.neurons:
+            # Set proper cluster reference
+            neuron.cluster = cluster
+            neuron.training_round = run_count
             noise = random.uniform(-0.05, 0.05)
             neuron.weight = min(1.0, max(0.0, neuron.weight + noise))
-        cluster.aggregate_signal(input_signal)
-        # In activation reporting and learning, randomly select guess from COLOR_LABELS
+        
+        # Use initial_round parameter for first few training rounds
+        cluster.aggregate_signal(input_signal, true_label=goal.replace("detect_", ""), initial_round=is_initial_round)
+        
+        # Report neuron states
         for idx, neuron in enumerate(cluster.neurons):
             neuron_guess = neuron.get_preferred_color()
             neuron.last_guess = neuron_guess
             true_label = goal.replace("detect_", "")
             correct = (neuron_guess == true_label)
-            if neuron.active:
-                print(f"    Neuron {neuron.position[0]}: specialty={neuron.specialty:.4f}, weight={neuron.weight:.4f}, active=True, guess={neuron_guess}, correct?={'yes' if correct else 'no'}, confidence={neuron.confidence:.4f}")
-            else:
-                print(f"    Neuron {neuron.position[0]}: specialty={neuron.specialty:.4f}, weight={neuron.weight:.4f}, active=False")
+            status = "INITIAL_ACTIVE" if is_initial_round else ("ACTIVE" if neuron.active else "INACTIVE")
+            print(f"    Neuron {neuron.position[0]}: specialty={neuron.specialty:.4f}, weight={neuron.weight:.4f}, status={status}, guess={neuron_guess}, correct?={'yes' if correct else 'no'}, confidence={neuron.confidence:.4f}")
+    
+    # Apply controller guidance for complementary specialization
+    controller.ensure_complementary_specialization()
 
-    print("[Step 7] Neurons sending messages to neighbors (with message noise)...")
+    print("[Step 7] Neurons sending messages to neighbors...")
+    total_messages_sent = 0
     for idx, neuron in enumerate(neurons):
-        original_send_message = neuron.send_message
-        def noisy_send_message():
-            if neuron.active and neuron.has_fired_this_round:
-                for neighbor in neuron.neighbors:
-                    if random.random() < 0.1:
-                        continue
-                    specialty_diff = abs(neuron.specialty - neighbor.specialty)
-                    if random.random() < 0.1:
-                        msg_type = 'excite' if specialty_diff >= 2.0 else 'inhibit'
-                    else:
-                        msg_type = 'excite' if specialty_diff < 2.0 else 'inhibit'
-                    neighbor.receive_message({'type': msg_type, 'from': neuron.position})
-        neuron.send_message = noisy_send_message
-        neuron.send_message()
-        neuron.send_message = original_send_message
-        print(f"    Neuron {idx}: sent messages, buffer={neuron.message_buffer}")
+        messages_sent = neuron.send_message(training_round=run_count)
+        total_messages_sent += messages_sent
+        
+        # Add some additional random messaging for exploration
+        if random.random() < 0.1 and neuron.neighbors:
+            neighbor = random.choice(neuron.neighbors)
+            specialty_diff = abs(neuron.specialty - neighbor.specialty)
+            msg_type = 'excite' if specialty_diff < 2.0 else 'inhibit'
+            neighbor.receive_message({
+                'type': msg_type, 
+                'from': neuron.position,
+                'training_round': run_count
+            })
+            total_messages_sent += 1
+            
+    print(f"  Total messages sent: {total_messages_sent}")
 
     print("[Step 8] Neuron learning step (with learning noise)...")
     neuron_changes = []
